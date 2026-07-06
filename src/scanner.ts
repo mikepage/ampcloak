@@ -30,7 +30,12 @@ export async function scanSite(opts: ScanOptions, onProgress: OnProgress): Promi
   const start = new URL(opts.startUrl);
   const siteDomain = registrableDomain(start.hostname);
 
-  const queue: string[] = [normalizeForVisit(start.href)];
+  // Always begin at the site origin (scheme://host), discarding any path the
+  // caller supplied. This lets the site's own redirects run (e.g. / -> /nl/),
+  // which preserves details like trailing slashes that path-keyed malware
+  // triggers on — a path passed in directly is subject to normalization that
+  // can strip exactly those details and silently miss the payload.
+  const queue: string[] = [normalizeForVisit(start.origin)];
   const seen = new Set<string>(queue);
   const pages: PageResult[] = [];
   let ampPagesFound = 0;
