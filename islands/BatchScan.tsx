@@ -29,7 +29,7 @@ interface BatchRow {
   error: string | null;
 }
 
-const MAX_DOMAINS = 50;
+const MAX_DOMAINS = 100;
 
 const PLACEHOLDER = "example.com\nexample.org\nexample.net";
 

@@ -9,7 +9,7 @@ export default define.page(function Batch() {
         <title>cloakscan — batch scan</title>
         <meta
           name="description"
-          content="Scan up to 50 domains in one batch for search-engine cloaking and AMP-cloaked injections."
+          content="Scan up to 100 domains in one batch for search-engine cloaking and AMP-cloaked injections."
         />
       </Head>
       <div class="px-6 md:px-12 py-8">
@@ -23,7 +23,7 @@ export default define.page(function Batch() {
             </a>
           </div>
           <p class="text-[#666] text-sm mb-8">
-            Scan up to 50 domains in one run. Domains are processed one at a time and results land
+            Scan up to 100 domains in one run. Domains are processed one at a time and results land
             in the table below as each scan finishes. For a single detailed report, use the{" "}
             <a href="/" class="text-blue-600 hover:underline">single-scan view</a>.
           </p>
