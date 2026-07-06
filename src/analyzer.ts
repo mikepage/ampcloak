@@ -1,4 +1,3 @@
-import { DOMParser, type HTMLDocument } from "@b-fuze/deno-dom";
 import type { Artifacts } from "./types.ts";
 import { hostOf, registrableDomain, resolveHttpUrl } from "./urls.ts";
 
@@ -48,12 +47,57 @@ const SPAM_KEYWORDS = [
   "vuitton",
 ];
 
-export function parseHtml(html: string): HTMLDocument | null {
-  try {
-    return new DOMParser().parseFromString(html, "text/html");
-  } catch {
-    return null;
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  "#39": "'",
+  nbsp: " ",
+};
+
+/** Minimal HTML-entity decode, enough to normalize attribute values (esp. &amp; in URLs). */
+function decodeEntities(s: string): string {
+  return s.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (m, body: string) => {
+    if (body[0] === "#") {
+      const code = body[1] === "x" || body[1] === "X"
+        ? parseInt(body.slice(2), 16)
+        : parseInt(body.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : m;
+    }
+    return NAMED_ENTITIES[body.toLowerCase()] ?? m;
+  });
+}
+
+/** Parse the attributes out of a start-tag's inner text into a lowercased-key map. */
+function parseAttrs(attrText: string): Map<string, string> {
+  const attrs = new Map<string, string>();
+  const re = /([^\s=/>"']+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+))?/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(attrText)) !== null) {
+    const name = m[1].toLowerCase();
+    let value = m[2] ?? "";
+    if (value.length >= 2 && (value[0] === '"' || value[0] === "'")) {
+      value = value.slice(1, -1);
+    }
+    if (!attrs.has(name)) attrs.set(name, decodeEntities(value));
   }
+  return attrs;
+}
+
+/** Iterate the start tags of a given tag name, yielding parsed attribute maps. */
+function* startTags(html: string, tag: string): Generator<Map<string, string>> {
+  const re = new RegExp(`<${tag}\\b([^>]*)>`, "gi");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    yield parseAttrs(m[1]);
+  }
+}
+
+function hasToken(value: string | undefined, token: string): boolean {
+  if (!value) return false;
+  return value.toLowerCase().split(/\s+/).includes(token);
 }
 
 function isJsonScriptType(type: string): boolean {
@@ -61,8 +105,14 @@ function isJsonScriptType(type: string): boolean {
   return t === "application/json" || t === "application/ld+json";
 }
 
-export function extractArtifacts(html: string, baseUrl: string): Artifacts {
-  const empty: Artifacts = {
+/**
+ * Extract the artifacts we diff across fetches (links, scripts, iframes, forms,
+ * AMP markers) directly from HTML. Intentionally dependency-free: every DOM
+ * library carries native/wasm/CJS baggage that breaks under Fresh's SSR bundler,
+ * and this scanner only needs attributes off a fixed set of tags.
+ */
+export function extractArtifacts(rawHtml: string, baseUrl: string): Artifacts {
+  const result: Artifacts = {
     links: [],
     scripts: [],
     inlineScripts: [],
@@ -73,46 +123,71 @@ export function extractArtifacts(html: string, baseUrl: string): Artifacts {
     ampUrl: null,
     canonicalUrl: null,
   };
-  const doc = parseHtml(html);
-  if (!doc) return empty;
 
-  const root = doc.documentElement;
-  empty.isAmp = root !== null &&
-    (root.hasAttribute("amp") || root.hasAttribute("⚡") || root.hasAttribute("⚡️"));
+  // Drop comments so we never extract tags that are commented out (matching
+  // DOM-parser behavior and avoiding spurious diffs from commented markup).
+  const html = rawHtml.replace(/<!--[\s\S]*?-->/g, "");
 
-  const collect = (selector: string, attr: string, into: string[]) => {
-    for (const el of doc.querySelectorAll(selector)) {
-      const raw = el.getAttribute(attr);
+  const htmlTag = /<html\b([^>]*)>/i.exec(html);
+  if (htmlTag) {
+    const attrs = parseAttrs(htmlTag[1]);
+    result.isAmp = attrs.has("amp") || attrs.has("⚡") || attrs.has("⚡️");
+  }
+
+  const collect = (tag: string, attr: string, into: string[]) => {
+    for (const attrs of startTags(html, tag)) {
+      const raw = attrs.get(attr);
       if (!raw) continue;
       const abs = resolveHttpUrl(raw, baseUrl);
       if (abs) into.push(abs);
     }
   };
 
-  collect("a[href]", "href", empty.links);
-  collect("script[src]", "src", empty.scripts);
-  collect("iframe[src]", "src", empty.iframes);
-  collect("form[action]", "action", empty.forms);
+  collect("a", "href", result.links);
+  collect("iframe", "src", result.iframes);
+  collect("form", "action", result.forms);
 
-  for (const el of doc.querySelectorAll("script:not([src])")) {
-    const type = el.getAttribute("type") ?? "text/javascript";
-    if (isJsonScriptType(type)) continue;
-    const body = el.textContent?.trim() ?? "";
-    if (body.length > 0) empty.inlineScripts.push(body);
+  // External <script src>.
+  for (const attrs of startTags(html, "script")) {
+    const src = attrs.get("src");
+    if (!src) continue;
+    const abs = resolveHttpUrl(src, baseUrl);
+    if (abs) result.scripts.push(abs);
   }
 
-  const ampLink = doc.querySelector('link[rel~="amphtml"]')?.getAttribute("href");
-  if (ampLink) empty.ampUrl = resolveHttpUrl(ampLink, baseUrl);
-  const canonical = doc.querySelector('link[rel~="canonical"]')?.getAttribute("href");
-  if (canonical) empty.canonicalUrl = resolveHttpUrl(canonical, baseUrl);
-
-  const refresh = doc.querySelector('meta[http-equiv="refresh" i]')?.getAttribute("content");
-  if (refresh) {
-    const m = refresh.match(/url\s*=\s*['"]?([^'";]+)/i);
-    if (m) empty.metaRefresh = resolveHttpUrl(m[1], baseUrl);
+  // Inline (executable) <script> bodies.
+  const scriptEl = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+  let sm: RegExpExecArray | null;
+  while ((sm = scriptEl.exec(html)) !== null) {
+    const attrs = parseAttrs(sm[1]);
+    if (attrs.has("src")) continue;
+    if (isJsonScriptType(attrs.get("type") ?? "text/javascript")) continue;
+    const body = sm[2].trim();
+    if (body.length > 0) result.inlineScripts.push(body);
   }
 
-  return empty;
+  for (const attrs of startTags(html, "link")) {
+    const href = attrs.get("href");
+    if (!href) continue;
+    const rel = attrs.get("rel");
+    if (!result.ampUrl && hasToken(rel, "amphtml")) {
+      result.ampUrl = resolveHttpUrl(href, baseUrl);
+    }
+    if (!result.canonicalUrl && hasToken(rel, "canonical")) {
+      result.canonicalUrl = resolveHttpUrl(href, baseUrl);
+    }
+  }
+
+  for (const attrs of startTags(html, "meta")) {
+    if ((attrs.get("http-equiv") ?? "").toLowerCase() !== "refresh") continue;
+    const content = attrs.get("content");
+    if (!content) continue;
+    const m = content.match(/url\s*=\s*['"]?([^'";]+)/i);
+    if (m) result.metaRefresh = resolveHttpUrl(m[1], baseUrl);
+    break;
+  }
+
+  return result;
 }
 
 /** URLs in `candidate` whose host is external to the site and absent from `reference`. */
